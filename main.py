@@ -176,7 +176,7 @@ class SettingsDialog(QDialog):
 
         # 行 4：设备类型
         self.device_combo = QComboBox()
-        self.device_combo.addItems(["神州", "神州SMT", "奔创", "Saki"])
+        self.device_combo.addItems(["神州", "神州SMT", "奔创", "Saki", "KY"])
         device_item = QTableWidgetItem("设备类型")
         device_item.setFlags(device_item.flags() & ~Qt.ItemIsEditable)
         self.table.setItem(4, 0, device_item)
@@ -941,6 +941,7 @@ class PyQtMainEntry(QMainWindow, Ui_mainWindow):
         self.imageTimer.start(200)
         self.dataTimer = QTimer(self)
         self.dataTimer.timeout.connect(self.ShowResult)
+        self.show_default_image()
         # 对所有需要增强的 QLabel 应用该样式
         for widget in self.findChildren(QLabel):
             self.apply_label_style(widget)
@@ -1093,9 +1094,45 @@ class PyQtMainEntry(QMainWindow, Ui_mainWindow):
     def closeEvent(self, event):
         clicked = self.custom_confirm_dialog('确认退出', "退出复判程序前请找技术员进行确认！！！")
         if clicked:
-            # 停止后台进程（如果存在）
+            # 1. 停止后台进程（确保子进程释放文件句柄）
             if hasattr(self, 'pool'):
                 self.pool.terminate()
+                self.pool.join() # 等待子进程完全结束
+            
+            # 2. 日志归档逻辑
+            try:
+                # 显式关闭日志系统，释放 check.log 的文件占用
+                logging.shutdown()
+                
+                log_file = 'check.log'
+                if os.path.exists(log_file):
+                    has_error = False
+                    try:
+                        # 读取日志内容检测是否存在 ERROR
+                        with open(log_file, 'r', encoding='gbk', errors='ignore') as f:
+                            content = f.read()
+                            if "ERROR" in content:
+                                has_error = True
+                    except Exception:
+                        pass # 读取失败则忽略
+
+                    if has_error:
+                        # 生成带时间戳的归档文件名
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        archive_name = f"check_{timestamp}_ERROR.log"
+                        
+                        # 重命名文件（实现归档）
+                        try:
+                            shutil.move(log_file, archive_name)
+                            print(f"【系统】检测到错误日志，已归档为: {archive_name}")
+                        except Exception as e:
+                            print(f"【系统】日志归档失败: {e}")
+                    else:
+                        # 如果没有错误，可以选择保留或删除，这里选择保留（方便查看历史INFO），但因为没有ERROR，下次启动不会弹窗
+                        pass
+
+            except Exception as e:
+                print(f"【系统】退出清理逻辑出错: {e}")
             
             event.accept()
         else:
@@ -1190,7 +1227,7 @@ class PyQtMainEntry(QMainWindow, Ui_mainWindow):
             QMessageBox.critical(self, "错误", str(e))
         self.state.setText("已开始复判")
         self.movie.start()
-        self.dataTimer.start(100)
+        self.dataTimer.start(1000)
         logging.info("已开始复判")
 
 
@@ -1226,36 +1263,59 @@ class PyQtMainEntry(QMainWindow, Ui_mainWindow):
         self.state.setText("已停止复判")
         self.movie.stop()
         self.dataTimer.stop()
+        self.show_default_image()
         logging.info("已停止复判")
 
     def ShowResult(self):
+        csv_path = 'history.csv'
         total_ok = 0
         total_ng = 0
+        
+        # 默认显示内容
+        filter_ratio = 0.0
+        display_text = "等待数据..."
+
         try:
-            with open(self.logFilePath, 'r', encoding='gbk', errors='ignore') as f:
-                lines = f.readlines()
-            for line in lines:
-                if ": OK" in line:
-                    total_ok += 1
-                elif ": NG" in line:
-                    total_ng += 1
+            if os.path.exists(csv_path):
+                # 使用 pandas 读取 CSV
+                try:
+                    df = pd.read_csv(csv_path, encoding='utf-8-sig')
+                except UnicodeDecodeError:
+                    df = pd.read_csv(csv_path, encoding='gbk', errors='ignore')
 
-            total_count = total_ok + total_ng
-            filter_ratio = total_ok / total_count * 100 if total_count > 0 else 0
+                if not df.empty and '结果' in df.columns:
+                    # --- 直接统计所有数据 ---
+                    
+                    # 统计 OK 和 NG (不筛选日期)
+                    total_ok = len(df[df['结果'] == 'OK'])
+                    total_ng = len(df[df['结果'] == 'NG'])
+                    
+                    total_count = total_ok + total_ng
+                    if total_count > 0:
+                        filter_ratio = (total_ok / total_count) * 100
+                    
+                    display_text = "📅 历史总数据统计"
+                else:
+                    display_text = "历史记录为空或格式错误"
+            else:
+                display_text = "历史记录文件未找到"
 
+            # 生成 HTML 显示内容
             html_content = f"""
             <div style="font-family: Microsoft YaHei, sans-serif; font-size: 14px; color: #003366;">
-                <p style="margin: 6px 0; color: #003366;"><b>📊 当前已复判完成：</b> <span style="color: #FFFFFF;">{total_count}</span> 张图片</p>
-                <p style="margin: 6px 0; color: #003366;"><b>✅ 复判 OK 数量： </b> <span style="color: #7DDA58; font-weight:bold;">{total_ok}</span></p>
-                <p style="margin: 6px 0; color: #003366;"><b>❌ 复判 NG 数量： </b> <span style="color: #E4080A; font-weight:bold;">{total_ng}</span></p>
-                <p style="margin: 6px 0; color: #003366;"><b>📈 复判过滤比例： </b> <span style="color: #5DE2E7; font-weight:bold;">{filter_ratio:.2f}%</span></p>
-                <p style="margin: 6px 0; color: #060270;">🕒 最后更新：{time.strftime("%H:%M:%S")}</p>
+                <p style="margin: 6px 0; color: #555555; font-size: 12px;">{display_text}</p>
+                <p style="margin: 6px 0; color: #003366;"><b>📊 累计已复判：</b> <span style="color: #000000;">{total_ok + total_ng}</span> 张</p>
+                <p style="margin: 6px 0; color: #003366;"><b>✅ 累计复判 OK 数量： </b> <span style="color: #2E7D32; font-weight:bold; font-size: 16px;">{total_ok}</span></p>
+                <p style="margin: 6px 0; color: #003366;"><b>❌ 累计复判 NG 数量： </b> <span style="color: #C62828; font-weight:bold; font-size: 16px;">{total_ng}</span></p>
+                <p style="margin: 6px 0; color: #003366;"><b>📈 累计复判率： </b> <span style="color: #00838F; font-weight:bold;">{filter_ratio:.2f}%</span></p>
+                <p style="margin: 6px 0; color: #888888; font-size: 10px;">🕒 更新时间：{datetime.now().strftime("%H:%M:%S")}</p>
             </div>
             """
             self.dataStats.setHtml(html_content)
 
         except Exception as e:
-            self.state.setText(f"读取日志文件时出错：{str(e)}")
+            logging.error(f"统计刷新失败: {str(e)}")
+            self.state.setText(f"统计刷新出错: {str(e)}")
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self)
@@ -1272,66 +1332,70 @@ class PyQtMainEntry(QMainWindow, Ui_mainWindow):
         dialog = DataQueryDialog(self)
         dialog.exec_()
 
+    def show_default_image(self):
+        """显示默认的欢迎/等待图片"""
+        try:
+            img_path = "img/init.png"
+            if not os.path.exists(img_path):
+                # 如果没有图片，清空显示
+                self.imageView.clear()
+                self.imageView.setText("等待图片...")
+                return
+
+            # 读取图片 (保留透明通道)
+            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return
+
+            # 获取 QLabel 实际显示尺寸
+            original_size = self.imageView.size()
+            target_width = original_size.width() - 60
+            target_height = original_size.height() - 60
+            
+            if target_width <= 0 or target_height <= 0:
+                return
+
+            # 等比缩放
+            h, w = img.shape[:2]
+            scale = min(target_width / w, target_height / h)
+            new_size = (int(w * scale), int(h * scale))
+            resized_img = cv2.resize(img, new_size)
+
+            # 转换为 QImage
+            if len(resized_img.shape) == 3 and resized_img.shape[2] == 4:
+                q_img = QImage(resized_img.data, resized_img.shape[1], resized_img.shape[0],
+                               resized_img.strides[0], QImage.Format_RGBA8888)
+            elif len(resized_img.shape) == 3 and resized_img.shape[2] == 3:
+                q_img = QImage(resized_img.data, resized_img.shape[1], resized_img.shape[0],
+                               resized_img.strides[0], QImage.Format_BGR888)
+            else:
+                q_img = QImage(resized_img.data, resized_img.shape[1], resized_img.shape[0],
+                               resized_img.strides[0], QImage.Format_Grayscale8)
+
+            pixmap = QPixmap.fromImage(q_img)
+            self.imageView.setPixmap(pixmap.scaled(
+                target_width, target_height,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            ))
+            self.lastImageFile = "" # 重置最后图片记录
+            
+        except Exception as e:
+            logging.error(f"显示默认图片失败: {e}")
+
     def update_display_image(self):
         # 检查 display 文件夹是否存在
         if not os.path.exists(self.displayFolderPath):
-            os.makedirs(self.displayFolderPath)  # 如果不存在，创建该文件夹
-            logging.info(f"已创建 display 文件夹: {self.displayFolderPath}")
-
-        # 保存当前QLabel的大小，确保不改变
-        original_size = self.imageView.size()
+            return
 
         # 获取 display 文件夹中的所有图像文件
         files = [f for f in os.listdir(self.displayFolderPath) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-        # 如果文件夹为空，则显示 welcome.jpg
+        # === 核心修改点 ===
+        # 如果文件夹为空，直接返回，保持当前 QLabel 上的图片不变
         if not files:
-            try:
-                img_path = "img/init.png"  # 假设 welcome.jpg 位于当前工作目录
-                if not os.path.exists(img_path):
-                    logging.warning("欢迎图 init.png 不存在")
-                    return
-                # 使用 cv2.IMREAD_UNCHANGED 可读取带透明通道的图像
-                img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-                if img is None:
-                    logging.error("无法读取欢迎图")
-                    return
-
-                # 获取 QLabel 实际显示尺寸
-                target_width = original_size.width() - 60  # 减去左右各30像素的间隙
-                target_height = original_size.height() - 60  # 减去上下各30像素的间隙
-
-                # 等比缩放图像
-                h, w = img.shape[:2]
-                scale = min(target_width / w, target_height / h)
-                new_size = (int(w * scale), int(h * scale))
-                resized_img = cv2.resize(img, new_size)
-
-                # 转换为 QImage（支持透明通道）
-                if len(resized_img.shape) == 3 and resized_img.shape[2] == 4:  # BGRA 格式
-                    q_img = QImage(resized_img.data, resized_img.shape[1], resized_img.shape[0],
-                                resized_img.strides[0], QImage.Format_RGBA8888)
-                elif len(resized_img.shape) == 3 and resized_img.shape[2] == 3:  # BGR 格式
-                    q_img = QImage(resized_img.data, resized_img.shape[1], resized_img.shape[0],
-                                resized_img.strides[0], QImage.Format_BGR888)
-                else:
-                    q_img = QImage(resized_img.data, resized_img.shape[1], resized_img.shape[0],
-                                resized_img.strides[0], QImage.Format_Grayscale8)
-
-                pixmap = QPixmap.fromImage(q_img)
-
-                # 设置 QPixmap 到 QLabel，并应用居中和留白
-                self.imageView.setPixmap(pixmap.scaled(
-                    target_width, target_height,
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                ))
-                self.lastImageFile = ""  # 不删除任何图片
-                return
-
-            except Exception as e:
-                logging.error(f"显示欢迎图失败: {e}")
-                return
+            return 
+        # ================
 
         # 处理文件夹中的图片
         pattern = re.compile(r'(.+)_(\d+)\.(jpg|jpeg|png)$', re.IGNORECASE)
@@ -1355,49 +1419,49 @@ class PyQtMainEntry(QMainWindow, Ui_mainWindow):
             return
 
         img_path = os.path.join(self.displayFolderPath, earliest_file)
+        original_size = self.imageView.size()
 
         try:
-            # 使用 IMREAD_UNCHANGED 来加载透明通道
+            # 读取并显示图片逻辑 (与之前保持一致)
             img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
             if img is None:
                 logging.error(f"无法读取图片: {img_path}")
                 return
 
-            # 获取 QLabel 实际显示尺寸
-            target_width = original_size.width() - 60  # 减去左右各30像素的间隙
-            target_height = original_size.height() - 60  # 减去上下各30像素的间隙
+            target_width = original_size.width() - 60
+            target_height = original_size.height() - 60
+            
+            if target_width <= 0 or target_height <= 0:
+                return
 
-            # 等比缩放图像，确保不超过显示区域
             h, w = img.shape[:2]
             scale = min(target_width / w, target_height / h)
             new_size = (int(w * scale), int(h * scale))
             resized_img = cv2.resize(img, new_size)
 
-            # 获取基础名和计数
+            # 获取基础名用于显示标签
             match = pattern.match(earliest_file)
             if match:
                 base_name, count_str, ext = match.groups()
-                label_text = f"{base_name.upper()}_{count_str}"
             else:
-                label_text = "IMAGE"
+                base_name = "IMAGE"
 
-            # 设置字体颜色：OK -> 绿色，NG -> 红色
+            # 绘制文字
             if "OK" in base_name.upper():
-                color = (0, 255, 0)  # BGR 绿色
+                color = (0, 255, 0)
             elif "NG" in base_name.upper():
-                color = (0, 0, 255)  # BGR 红色
+                color = (0, 0, 255)
             else:
-                color = (255, 255, 255)  # 白色（默认）
+                color = (255, 255, 255)
 
-            # 在右上角绘制文本（使用缩放后的图像尺寸）
             cv2.putText(resized_img, base_name.upper(), (resized_img.shape[1] - 80, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 2, cv2.LINE_AA)
 
-            # 转换为 QImage（支持透明通道）
-            if len(resized_img.shape) == 3 and resized_img.shape[2] == 4:  # BGRA 格式
+            # 转 QImage
+            if len(resized_img.shape) == 3 and resized_img.shape[2] == 4:
                 q_img = QImage(resized_img.data, resized_img.shape[1], resized_img.shape[0],
                             resized_img.strides[0], QImage.Format_RGBA8888)
-            elif len(resized_img.shape) == 3 and resized_img.shape[2] == 3:  # BGR 格式
+            elif len(resized_img.shape) == 3 and resized_img.shape[2] == 3:
                 q_img = QImage(resized_img.data, resized_img.shape[1], resized_img.shape[0],
                             resized_img.strides[0], QImage.Format_BGR888)
             else:
@@ -1405,8 +1469,6 @@ class PyQtMainEntry(QMainWindow, Ui_mainWindow):
                             resized_img.strides[0], QImage.Format_Grayscale8)
 
             pixmap = QPixmap.fromImage(q_img)
-
-            # 设置 QPixmap 到 QLabel，并应用居中和留白
             self.imageView.setPixmap(pixmap.scaled(
                 target_width, target_height,
                 Qt.KeepAspectRatio,
@@ -1424,7 +1486,7 @@ class PyQtMainEntry(QMainWindow, Ui_mainWindow):
                     except Exception as e:
                         logging.warning(f"无法删除旧图片 {f}: {e}")
 
-            # 短暂延迟后重置 lastImageFile，允许显示相同计数的新图片
+            # 允许后续显示相同计数的新图片
             QTimer.singleShot(500, lambda: setattr(self, 'lastImageFile', ''))
 
         except Exception as e:
