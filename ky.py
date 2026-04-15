@@ -312,11 +312,11 @@ def process_all_files(check, directory, resPath):
                                     checkresult = "AIOK"
                             
                             logging.info(f"OCR复判: 目标={target_angle}, 识别={ocr_pred_angle}, 复判结果: {res}")
-                        
                         else:
                             # === 新增：如果无法解析角度，打印警告 ===
                             logging.warning(f"OCR复判跳过: 文件名 '{image_name}' 无法提取角度 (需如 1_J1101_90.jpg), 默认结果: {res}")
 
+                        
                     except Exception as e:
                         logging.error(f"OCR处理出错: {e}")
 

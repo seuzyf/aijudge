@@ -11,8 +11,10 @@ ICON_FILE = os.path.join("img", "icon.ico")
 MODULES_TO_HIDE_IMPORT = [
     "shenzhou",
     "benchuangSMT",
+    "benchuang",
     "saki",
     "shenzhouSMT",
+    "ky",
     "matplotlib.backends.backend_tkagg",
 ]
 

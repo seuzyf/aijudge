@@ -3,7 +3,8 @@ import importlib
 DEVICE_MODULE_MAP = {
     "神州": "shenzhou",
     "神州SMT": "shenzhouSMT",
-    "奔创": "benchuangSMT",
+    "奔创SMT": "benchuangSMT",
+    "奔创": "benchuang",
     "Saki": "saki",
     "KY": "ky"
 }
