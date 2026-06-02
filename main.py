@@ -160,7 +160,7 @@ class SettingsDialog(QDialog):
 
         # 行 2：OK范围
         self.ok_range_combo = QComboBox()
-        self.ok_range_combo.addItems([f"{i * 0.1:.1f}" for i in range(1, 11)])
+        self.ok_range_combo.addItems([f"{i * 0.1:.1f}" for i in range(0, 11)])
         ok_item = QTableWidgetItem("OK范围")
         ok_item.setFlags(ok_item.flags() & ~Qt.ItemIsEditable)
         self.table.setItem(2, 0, ok_item)
@@ -176,7 +176,7 @@ class SettingsDialog(QDialog):
 
         # 行 4：设备类型
         self.device_combo = QComboBox()
-        self.device_combo.addItems(["神州", "神州SMT", "奔创", "奔创SMT", "Saki", "KY"])
+        self.device_combo.addItems(["神州", "神州SMT", "奔创", "奔创SMT", "Saki", "KY", "智能电动异物检测"])
         device_item = QTableWidgetItem("设备类型")
         device_item.setFlags(device_item.flags() & ~Qt.ItemIsEditable)
         self.table.setItem(4, 0, device_item)
@@ -1230,7 +1230,6 @@ class PyQtMainEntry(QMainWindow, Ui_mainWindow):
         self.dataTimer.start(1000)
         logging.info("已开始复判")
 
-
     def btnStopCheckClk(self):
         if not hasattr(self, 'pool'):
             self.state.setText("请先启动复判")
@@ -1759,4 +1758,3 @@ if __name__ == "__main__":
     """)
     window.show()
     sys.exit(app.exec_())
-    

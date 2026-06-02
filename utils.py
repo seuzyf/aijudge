@@ -6,7 +6,8 @@ DEVICE_MODULE_MAP = {
     "奔创SMT": "benchuangSMT",
     "奔创": "benchuang",
     "Saki": "saki",
-    "KY": "ky"
+    "KY": "ky",
+    "智能电动异物检测": "yw"
 }
 
 def get_device_module(device_name):

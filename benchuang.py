@@ -113,34 +113,56 @@ def copy_to_display_folder(image_path, result):
 def read_threshold_from_config(config_path='config.txt'):
     default_okrange = 0.5
     default_collect = 0
+    default_lag = 1.0  # 新增 lag 默认值，使用浮点数以兼容小数秒
+    
     okrange_found = False
     collect_found = False
+    lag_found = False  # 新增 lag 查找标志
+    
+    # 初始化变量，防止文件存在但某项缺失时引发 UnboundLocalError
+    okrange_value = default_okrange
+    collect_value = default_collect
+    lag_value = default_lag
+
     try:
         if not os.path.exists(config_path):
             with open(config_path, 'w') as f:
                 f.write(f"okRange={default_okrange}\n")
                 f.write(f"collect={default_collect}\n")
-            return default_okrange, default_collect
+                f.write(f"lag={default_lag}\n")
+            return default_okrange, default_collect, default_lag
+            
         with open(config_path, 'r') as f:
             lines = f.readlines()
             for line in lines:
+                line = line.strip()
+                if not line or '=' not in line:
+                    continue
                 if line.startswith("okRange"):
-                    _, val = line.strip().split("=")
+                    _, val = line.split("=")
                     okrange_value = float(val)
                     okrange_found = True
                 elif line.startswith("collect"):
-                    _, val = line.strip().split("=")
+                    _, val = line.split("=")
                     collect_value = int(val)
                     collect_found = True
+                elif line.startswith("lag"):
+                    _, val = line.split("=")
+                    lag_value = float(val)
+                    lag_found = True
+                    
         with open(config_path, 'a') as f:
             if not okrange_found:
                 f.write(f"okRange={default_okrange}\n")
             if not collect_found:
                 f.write(f"collect={default_collect}\n")
-        return okrange_value, collect_value
+            if not lag_found:
+                f.write(f"lag={default_lag}\n")
+                
+        return okrange_value, collect_value, lag_value
     except Exception as e:
         logging.error(f"配置读取失败: {e}")
-        return default_okrange, default_collect
+        return default_okrange, default_collect, default_lag
 
 def copy_image_with_suffix(src_path, dest_folder, ngtype, result):
     """将图片按 {原文件名}_{NG_NAME}_{FLAG}.jpg 命名拷贝到目标文件夹"""
@@ -214,7 +236,9 @@ def process_all_files(check, directory, xmlPath):
     disp = 1
     DISPLAY_FOLDER = "display"
     os.makedirs(DISPLAY_FOLDER, exist_ok=True)
-    okrange, collect = read_threshold_from_config()
+    
+    # 接收新增的 lag 参数
+    okrange, collect, lag = read_threshold_from_config()
 
     while check:
         items = os.listdir(directory)
@@ -223,10 +247,15 @@ def process_all_files(check, directory, xmlPath):
             time.sleep(2)
             continue
 
-        #  获取当前处理的文件夹名
+        # 获取当前处理的文件夹名
         current_folder_name = folders[0]
         checkPath = os.path.join(directory, current_folder_name) # 使用 current_folder_name
-        checkPath = os.path.join(checkPath, current_folder_name) # 使用 current_folder_name
+        
+        # --- 新增的延时逻辑 ---
+        logging.info(f"扫描到复判文件夹: {current_folder_name}，等待 {lag} 秒以确保 CSV 文件输出完全...")
+        time.sleep(lag)
+        # ----------------------
+
         imagePath = os.path.join(checkPath, 'NGPartImage')
 
         for filename in os.listdir(checkPath):
@@ -238,7 +267,6 @@ def process_all_files(check, directory, xmlPath):
             # 不再创建子文件夹，直接使用OK和NG文件夹
             os.makedirs(okPath, exist_ok=True)
             os.makedirs(ngPath, exist_ok=True)
-            logging.info("333。")
             try:
                 with open(csvPath, 'rb') as f:
                     content_bytes = f.read()
@@ -264,7 +292,7 @@ def process_all_files(check, directory, xmlPath):
                 # 从CSV中提取必要信息
                 program_name = row.get('JOBNAME', '')   # 程序名
                 board_code = row.get('ARRAY_BARCODE', '')  # 单板条码
-                ngtype = row.get('NG_NAME', '').lower()         # 缺陷类型
+                ngtype = row.get('NG_NAME', '').lower()        # 缺陷类型
                 file_name_part = f"{row.iloc[4]}@{row.iloc[7]}"  # 使用iloc避免FutureWarning
                 # 定义可能的后缀列表（按优先级排序）
                 suffix_list = [
