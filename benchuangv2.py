@@ -21,14 +21,14 @@ try:
     from ultralytics import YOLO
     model = YOLO("./model/benchuang.pt")
     model.eval()
-    logging.info("载入模型：奔创 Mount 贴装检测模型成功")
+    logging.info("载入模型：奔创偏位检测模型成功")
 except Exception as e:
     print(f"模型加载提示: {e}")
 
 try:
     from paddleocr import DocImgOrientationClassification
     ocr_model = DocImgOrientationClassification(model_dir="./model/PP-LCNet_x1_0_doc_ori")
-    logging.info("载入模型：奔创 Solder(OCR) 检测模型成功")
+    logging.info("载入模型：奔创OCR检测模型成功")
 except Exception as e:
     print(f"OCR模型加载提示: {e}")
 
@@ -214,8 +214,8 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                                 # 非这四个类型的，如果不做要求默认维持原判
                                 pass
 
-            elif algo_type == '4':
-                # 分支 2：Type 为 4 (对应 OCR 角度识别)
+            elif algo_type == '6':
+                # 分支 2：Type 为 6 (对应 OCR 角度识别)
                 if ocr_model is not None:
                     new_w, new_h = w_img // 3, h_img // 3
                     start_x, start_y = (w_img - new_w) // 2, (h_img - new_h) // 2
