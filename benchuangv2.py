@@ -10,6 +10,9 @@ from datetime import datetime
 
 os.environ['PADDLE_USE_MKLDNN'] = '0'
 
+# ================= 定义类别名称列表 (与 benchuangSMT 同步) =================
+class_names = ['ChipR', 'SOP', 'SOT23', 'QFP']
+
 # ================= 载入算法模型 =================
 model = None
 ocr_model = None
@@ -130,7 +133,6 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
         logging.error(f"XML 文件解析失败 {xml_path}: {e}")
         return
 
-    # 尝试提取面板条码等基础信息（如果有对应标签可修改为真实标签名）
     board_code = root.findtext('.//Barcode') or "Unknown"
     program_name = root.findtext('.//JobName') or "Unknown"
     task_order = root.findtext('.//LotNo') or "Unknown"
@@ -173,7 +175,6 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
         # 内层循环：遍历该元件下的所有判定窗口 (不同算法)
         for window in part.findall('.//WindowDataList/WindowData'):
             win_id = window.findtext('ID')
-            prop_type = window.findtext('PropertyType')
             
             # 定位该窗口的NG标识节点 (一般为 <ENABLE>True</ENABLE>)
             enable_node = window.find('ENABLE')
@@ -182,11 +183,15 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                 
             checkresult = "AING"
             res = "NG"
-            algo_log_name = f"{prop_type}_{win_id}"
+
+            # 取窗口内的第一个算法节点作为判据
+            algo_node = window.find('.//AlgorithmDataList/AlgorithmData')
+            algo_type = algo_node.findtext('Type') if algo_node is not None else "Unknown"
+            algo_log_name = f"Type{algo_type}_{win_id}"
 
             # ================= 算法路由分支 =================
-            if prop_type == 'Mount':
-                # 分支 1：贴装偏移检测，使用 YOLO 检测目标框
+            if algo_type == '3':
+                # 分支 1：Type 为 3 (对应 benchuangSMT 的 shift)
                 if model is not None:
                     results = model.predict(image_path, conf=okrange, verbose=False)
                     for result in results:
@@ -194,13 +199,23 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                             x, y, r = result.obb.xywhr[0][0], result.obb.xywhr[0][1], result.obb.xywhr[0][-1]
                             distance = math.hypot(x - center_x, y - center_y)
                             angle_degrees = math.degrees(r)
-                            # 判定条件：靠近中心且角度不偏移
-                            if distance < 30 and not (30 <= angle_degrees <= 150):
-                                checkresult, res = "AIOK", "OK"
-                                break
+                            cls_id = int(result.obb.cls[0].item())
+                            device_type = class_names[cls_id] if cls_id < len(class_names) else "UNK"
+                            
+                            logging.info(f"图片 {image_name}，偏移距离: {distance:.2f} pixels, 旋转角度: {angle_degrees:.2f} degrees")
+                            
+                            if device_type in ['SOP', 'ChipR', 'SOT23', 'QFP']:
+                                if distance >= 30 or (30 <= angle_degrees <= 150):
+                                    checkresult, res = "AING", "NG"
+                                else:
+                                    checkresult, res = "AIOK", "OK"
+                                    break # 确认找到OK，跳出结果遍历
+                            else:
+                                # 非这四个类型的，如果不做要求默认维持原判
+                                pass
 
-            elif prop_type == 'Solder':
-                # 分支 2：焊点/OCR 检测，使用 PaddleOCR 对图片中心进行识别
+            elif algo_type == '4':
+                # 分支 2：Type 为 4 (对应 OCR 角度识别)
                 if ocr_model is not None:
                     new_w, new_h = w_img // 3, h_img // 3
                     start_x, start_y = (w_img - new_w) // 2, (h_img - new_h) // 2
@@ -220,12 +235,19 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                     
                     if ocr_output and len(ocr_output) > 0 and isinstance(ocr_output[0], dict):
                         scores = ocr_output[0].get('scores', [])
-                        if scores and float(scores[0]) >= okrange:
-                            checkresult, res = "AIOK", "OK"
+                        label_names = ocr_output[0].get('label_names', [])
+                        if scores and label_names:
+                            ocr_angle = float(label_names[0])
+                            ocr_score = float(scores[0])
+                            logging.info(f"图片 {image_name} OCR预测角度: {ocr_angle}°, 置信度: {ocr_score}")
+                            
+                # == 打桩测试点 ==：不论预测角度为多少，强制将其判定为 NG
+                checkresult, res = "AING", "NG"
 
             else:
-                # 若存在未定义的算法类型 (如 OCR 等其他类型)，默认跳过或维持原判
-                continue
+                # 别的不判，全部维持 NG 判定
+                logging.info(f"图片 {image_name} 的未定义算法 Type={algo_type} 强制判定为 NG")
+                pass
             
             # 记录本轮复判结果
             write_to_history(task_order, program_name, board_code, image_name, algo_log_name, res)
@@ -251,7 +273,7 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
 
 def process_all_files(check, directory, resPath):
     """
-    监控引擎主控逻辑，包含层级遍历与结果搬运
+    监控引擎主控逻辑，包含层级遍历与结果搬运（同 Saki 直接移交维修站）
     """
     logging.info(f"奔创SMTv2智能复判启动。读取监控源: {directory}, 写入维修站目标: {resPath}")
     
@@ -283,10 +305,10 @@ def process_all_files(check, directory, resPath):
                 logging.info(f"定位到数据包: {xml_path}，为防止图片未写入完毕挂起 {lag} 秒...")
                 time.sleep(lag)
                 
-                # 开始解析复判该文件夹下的 XML
+                # 开始解析复判该文件夹下的 XML，并覆写原本 XML
                 process_single_xml(xml_path, root, okrange, collect, okPath, ngPath)
                 
-                # 提取相对路径层级，整包搬运
+                # 提取相对路径层级，整包搬运 (类 Saki 直接抛去维修站目录)
                 rel_path = os.path.relpath(root, directory)
                 target_dir = os.path.join(resPath, rel_path)
                 
