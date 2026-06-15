@@ -7,29 +7,32 @@ import logging
 import csv
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from pathlib import Path
+import numpy as np
+import onnxruntime as ort
 
 os.environ['PADDLE_USE_MKLDNN'] = '0'
 
 # ================= 定义类别名称列表 =================
 class_names = ['ChipR', 'SOP', 'SOT23', 'QFP']
 
-# ================= 载入算法模型 =================
-model = None
-ocr_model = None
+# ================= 载入算法模型 (全 ONNX 架构) =================
+yolo_session = None
+ocr_session = None
+
+# 使用 CPU 引擎，完美兼容老旧工控机
+providers = ['CPUExecutionProvider']
 
 try:
-    from ultralytics import YOLO
-    model = YOLO("./model/benchuang.pt")
-    model.eval()
-    logging.info("载入模型：奔创偏位检测模型成功")
+    yolo_session = ort.InferenceSession("./model/benchuang.onnx", providers=providers)
+    logging.info("载入模型：奔创偏位检测模型 (ONNX) 成功")
 except Exception as e:
     logging.error(f"偏位模型加载失败: {e}")
     print(f"偏位模型加载提示: {e}")
 
 try:
-    from paddleocr import DocImgOrientationClassification
-    ocr_model = DocImgOrientationClassification(model_dir="./model/PP-LCNet_x1_0_doc_ori")
-    logging.info("载入模型：奔创OCR检测模型成功")
+    ocr_session = ort.InferenceSession("./model/PP-LCNet_doc_ori.onnx", providers=providers)
+    logging.info("载入模型：奔创OCR方向模型 (ONNX) 成功")
 except Exception as e:
     logging.error(f"OCR模型加载失败: {e}")
     print(f"OCR模型加载提示: {e}")
@@ -44,43 +47,6 @@ logging.basicConfig(
 DISPLAY_FOLDER = "display"
 os.makedirs(DISPLAY_FOLDER, exist_ok=True)
 disp = 1
-
-# ================= 动态获取XML标准角度 =================
-def get_angle_from_xml(xml_path):
-    """
-    从子XML获取元件标准角度。查找 <PartData> 下的 <Roi> <a> 值。
-    """
-    try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-        
-        part_data = root.find('.//PartData') or root.find('.//PARTDATA')
-        if part_data is not None:
-            roi_elem = part_data.find('.//Roi') or part_data.find('.//ROI')
-            if roi_elem is not None:
-                angle_elem = roi_elem.find('a') or roi_elem.find('A')
-                if angle_elem is not None and angle_elem.text is not None:
-                    try:
-                        angle_value = float(angle_elem.text)
-                        # 特殊角度转换对齐
-                        if angle_value == 270.0:
-                            angle_value = 90.0
-                        elif angle_value == 90.0:
-                            angle_value = 270.0
-                        logging.info(f"成功从XML获取标准角度并转换后: {angle_value}°")
-                        return angle_value
-                    except ValueError:
-                        logging.warning(f"XML文件 {xml_path} 中的 angle 值无法转换为浮点数。")
-                        return None
-                else:
-                    logging.info("进入 XML 未找到 <a> 标签分支")
-            else:
-                logging.info("进入 XML 未找到 <Roi> 标签分支")
-        else:
-            logging.info("进入 XML 未找到 <PartData> 标签分支")
-    except Exception as e:
-        logging.error(f"解析XML文件 {xml_path} 失败: {e}")
-    return None
 
 def copy_to_display_folder(image_path, result):
     """将图片按 {result}{count}.jpg 命名拷贝到 display 文件夹，供前端界面展示"""
@@ -161,9 +127,7 @@ def write_to_history(task_order, program_name, board_code, image_name, ngtype, r
         writer.writerow(new_row)
 
 def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
-    """
-    核心：使用 ElementTree 结构化解析 Total result NG.xml。
-    """
+    """核心：使用 ElementTree 结构化解析 Total result NG.xml。"""
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
@@ -210,6 +174,27 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
         
         if parent_id == "Unknown" or part_id == "Unknown":
             continue
+
+        # ================= 暴力深度遍历获取角度 =================
+        xml_angle = None
+        for child in part.iter():
+            tag_name = child.tag.split('}')[-1].lower()
+            if tag_name == 'roi':
+                for sub in child.iter():
+                    sub_tag = sub.tag.split('}')[-1].lower()
+                    if sub_tag == 'a' and sub.text is not None:
+                        try:
+                            xml_angle = float(sub.text.strip())
+                            # 特殊角度转换对齐
+                            if xml_angle == 270.0:
+                                xml_angle = 90.0
+                            elif xml_angle == 90.0:
+                                xml_angle = 270.0
+                            logging.info(f"  --> [XML] 元件 {parent_id}@{part_id} 成功提取标准角度: {xml_angle}°")
+                        except ValueError:
+                            pass
+                break
+        # =======================================================
             
         image_name = f"{parent_id}@{part_id}_AC.jpg"
         image_path = os.path.join(folder_path, image_name)
@@ -229,10 +214,18 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                 continue
 
         logging.info(f"正在处理元件 {idx}/{part_count}: {image_name}")
-        img_for_dim = cv2.imread(image_path)
+        
+        # ================== 核心修复：绕过 OpenCV 的中文路径读取 Bug ==================
+        try:
+            # 使用 numpy 以二进制流读入内存，再通过 imdecode 解码
+            img_for_dim = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        except Exception as e:
+            img_for_dim = None
+
         if img_for_dim is None:
             logging.warning(f"无法读取图片: {image_path}")
             continue
+        # ==============================================================================
             
         h_img, w_img = img_for_dim.shape[:2]
         center_x, center_y = w_img / 2.0, h_img / 2.0
@@ -272,34 +265,67 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                 algo_log_name = f"Type{algo_type}_{win_id}"
 
                 if algo_type == '3':
-                    if model is not None:
-                        results = model.predict(image_path, conf=okrange, verbose=False)
-                        total_obbs = sum(len(r.obb.xywhr) for r in results if r.obb)
-                        
-                        if total_obbs == 0:
-                            logging.info(f"  --> [Type3] 窗口:{win_id} 未检测到目标框，判定: NG")
-                        
-                        for result in results:
-                            if result.obb and len(result.obb.xywhr) > 0:
-                                x, y, r = result.obb.xywhr[0][0], result.obb.xywhr[0][1], result.obb.xywhr[0][-1]
-                                conf = float(result.obb.conf[0].item())
-                                distance = math.hypot(x - center_x, y - center_y)
-                                angle_degrees = math.degrees(r)
-                                cls_id = int(result.obb.cls[0].item())
-                                device_type = class_names[cls_id] if cls_id < len(class_names) else "UNK"
+                    if yolo_session is not None:
+                        try:
+                            # 1. 动态读取模型输入尺寸 (OBB 通常为 1024x1024)
+                            yolo_input_shape = yolo_session.get_inputs()[0].shape
+                            model_h = yolo_input_shape[2] if isinstance(yolo_input_shape[2], int) else 1024
+                            model_w = yolo_input_shape[3] if isinstance(yolo_input_shape[3], int) else 1024
+                            
+                            # 2. Letterbox 尺寸缩放，保证目标不形变
+                            scale = min(model_w / w_img, model_h / h_img)
+                            new_unpad_w, new_unpad_h = int(round(w_img * scale)), int(round(h_img * scale))
+                            dw, dh = (model_w - new_unpad_w) / 2, (model_h - new_unpad_h) / 2
+                            
+                            resized = cv2.resize(img_for_dim, (new_unpad_w, new_unpad_h), interpolation=cv2.INTER_LINEAR)
+                            top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+                            left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+                            padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+                            
+                            # 3. HWC to CHW 及归一化
+                            blob = padded[..., ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
+                            blob = np.expand_dims(blob, axis=0)
+                            
+                            # 4. 执行推理
+                            yolo_out = yolo_session.run(None, {yolo_session.get_inputs()[0].name: blob})[0]
+                            preds = yolo_out[0].T # 转置为 [N, 4 + num_classes + 1]
+
+                            # 5. 直接提取最高置信度的目标
+                            class_scores = preds[:, 4:-1]
+                            max_scores = np.max(class_scores, axis=1)
+                            best_idx = np.argmax(max_scores)
+                            best_score = max_scores[best_idx]
+
+                            if best_score < okrange:
+                                logging.info(f"  --> [Type3] 窗口:{win_id} 未检测到满足阈值的目标框，判定: NG")
+                            else:
+                                best_pred = preds[best_idx]
+                                cls_id = int(np.argmax(best_pred[4:-1]))
+                                pred_x, pred_y = best_pred[0], best_pred[1]
+                                pred_r = best_pred[-1] # ONNX导出的 YOLOv8-OBB 角度直接为弧度
                                 
+                                # 坐标映射回原图
+                                orig_x = (pred_x - left) / scale
+                                orig_y = (pred_y - top) / scale
+                                
+                                distance = math.hypot(orig_x - center_x, orig_y - center_y)
+                                angle_degrees = math.degrees(pred_r)
+                                device_type = class_names[cls_id] if cls_id < len(class_names) else "UNK"
+
                                 temp_res = "NG"
                                 if device_type in ['SOP', 'ChipR', 'SOT23', 'QFP']:
                                     if distance >= 30 or (30 <= angle_degrees <= 150):
                                         temp_res = "NG"
                                     else:
                                         temp_res = "OK"
-                                
-                                logging.info(f"  --> [Type3] 类别:{device_type} 置信度:{conf:.3f} 角度:{angle_degrees:.2f}° 偏移距:{distance:.2f} 判定: {temp_res}")
-                                
+
+                                logging.info(f"  --> [Type3] 类别:{device_type} 置信度:{best_score:.3f} 角度:{angle_degrees:.2f}° 偏移距:{distance:.2f} 判定: {temp_res}")
+
                                 if temp_res == "OK":
                                     checkresult, res = "AIOK", "OK"
-                                    break
+                                    
+                        except Exception as e:
+                            logging.error(f"  --> [Type3] 处理 OBB 检测时发生异常: {e}", exc_info=True)
                     else:
                         logging.info(f"  --> [Type3] 进入模型未加载异常分支，强制锁定结果为 NG")
                                 
@@ -307,8 +333,7 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
 
                 elif algo_type == '6':
                     checkresult, res = "AING", "NG"
-                    
-                    if ocr_model is not None:
+                    if ocr_session is not None:
                         try:
                             # 1. 裁剪画面正中心的1/3区域
                             new_w = w_img // 3
@@ -321,42 +346,41 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                             gray_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
                             enhanced_image = cv2.convertScaleAbs(gray_image, alpha=3, beta=0)
 
-                            # 3. 将处理后的图像保存为临时路径供模型预测使用
-                            temp_image_path = image_path.replace(".jpg", f"_enhanced_tmp_{win_id}.jpg")
-                            cv2.imwrite(temp_image_path, enhanced_image)
-
-                            # 4. 调用 OCR 模型进行预测
-                            ocr_output = ocr_model.predict(temp_image_path, batch_size=1)
-                            ocr_angle = None
-                            ocr_score = None
-                            
-                            # 删除临时图片
-                            if os.path.exists(temp_image_path):
-                                os.remove(temp_image_path)
+                            # 3. ONNX 图像预处理 (无需写入临时文件，缩放至 224x224, 转RGB, 归一化)
+                            img_resized = cv2.resize(enhanced_image, (224, 224))
+                            if len(img_resized.shape) == 2:
+                                img_resized = cv2.cvtColor(img_resized, cv2.COLOR_GRAY2RGB)
+                            else:
+                                img_resized = cv2.cvtColor(img_resized, cv2.BGR2RGB)
                                 
-                            if ocr_output and len(ocr_output) > 0:
-                                first_result = ocr_output[0]
-                                if isinstance(first_result, dict):
-                                    label_names = first_result.get('label_names', [])
-                                    scores = first_result.get('scores', [])
+                            img_normalized = img_resized.astype(np.float32) / 255.0
+                            img_normalized -= np.array([0.485, 0.456, 0.406])
+                            img_normalized /= np.array([0.229, 0.224, 0.225])
+                            
+                            input_tensor = np.expand_dims(np.transpose(img_normalized, (2, 0, 1)), axis=0)
 
-                                    if label_names and len(label_names) > 0 and scores and len(scores) > 0:
-                                        ocr_angle_str = label_names[0]
-                                        ocr_angle = float(ocr_angle_str)
-                                        ocr_score = float(scores[0])
-                                        logging.info(f"  --> [Type6] OCR预测角度: {ocr_angle}°, 置信度: {ocr_score:.3f}")
-                                        
-                                        if ocr_score < okrange:
-                                            ocr_angle = None
-                                            logging.warning("  --> [Type6] 进入OCR置信度低于阈值分支，忽略预测角度，判定NG")
+                            # 4. 执行推理
+                            ocr_out = ocr_session.run(None, {ocr_session.get_inputs()[0].name: input_tensor})[0]
+                            
+                            # 5. Softmax 解析结果
+                            probs = np.exp(ocr_out[0]) / np.sum(np.exp(ocr_out[0]))
+                            class_id = int(np.argmax(probs))
+                            ocr_score = float(probs[class_id])
+                            
+                            angles_map = [0.0, 90.0, 180.0, 270.0]
+                            ocr_angle = None
+                            
+                            if class_id < len(angles_map):
+                                ocr_angle = angles_map[class_id]
+                                logging.info(f"  --> [Type6] OCR预测角度: {ocr_angle}°, 置信度: {ocr_score:.3f}")
+                                
+                                if ocr_score < okrange:
+                                    ocr_angle = None
+                                    logging.warning("  --> [Type6] 进入OCR置信度低于阈值分支，忽略预测角度，判定NG")
+                            else:
+                                logging.info(f"  --> [Type6] OCR无预测角度")
 
                             if ocr_angle is not None:
-                                # 构造对应的XML文件路径以获取标准角度
-                                xml_filename = os.path.splitext(os.path.basename(image_path))[0] + ".xml"
-                                xml_path_for_angle = os.path.join(folder_path, xml_filename)
-                                
-                                xml_angle = get_angle_from_xml(xml_path_for_angle)
-                                
                                 if xml_angle is not None:
                                     valid_angles = [0.0, 90.0, 180.0, 270.0]
                                     if ocr_angle in valid_angles and xml_angle in valid_angles:
@@ -369,7 +393,7 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                                     else:
                                         logging.info(f"  --> [Type6] 进入无效角度分支，标准或预测不在0/90/180/270中。复判结果: NG")
                                 else:
-                                    logging.info(f"  --> [Type6] 进入获取XML标准角度失败分支，保持判NG")
+                                    logging.info(f"  --> [Type6] 当前元件在XML中无有效角度值，保持判NG")
                                     
                         except Exception as e:
                             logging.error(f"  --> [Type6] 处理 'OCR' 时发生异常: {e}", exc_info=True)
@@ -439,29 +463,74 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
 
     return False
 
+def remove_empty_dirs(path, stop_path):
+    """
+    向上递归清理空层级目录，避免复判完成后留下一堆层级空文件夹
+    直到遇到基础安全目录 (stop_path) 为止
+    """
+    try:
+        path = os.path.abspath(path)
+        stop_path = os.path.abspath(stop_path)
+        current = os.path.dirname(path)
+        
+        while current and current.startswith(stop_path) and current != stop_path:
+            if os.path.exists(current) and os.path.isdir(current) and not os.listdir(current):
+                os.rmdir(current)
+                logging.info(f"已自动向上清理空单板层级目录: {current}")
+                current = os.path.dirname(current)
+            else:
+                break
+    except Exception as e:
+        logging.error(f"清理单板空目录机制报错: {e}")
+
 def sync_and_move_board_packages(root_dir, src_base, dst_base, is_now_all_ok=False):
-    """整包协同搬运机制：采用复制 (copytree) 不删除原文件。"""
+    """
+    整包协同转移机制：
+    1. 动态生成包含 Image / TempInspResult / ResultData / FiduResult 等核心全套数据结构。
+    2. 执行物理转移：将数据同步（复制）到维修站路径。
+    3. 清理源文件时，【绝对限制】只允许清理 Image 下的判过单板文件夹，其他所有附随文件夹必须被保留在原位。
+    """
     rel_path = os.path.relpath(root_dir, src_base)
     paths_to_sync = [rel_path]
+    parts = Path(rel_path).parts
 
-    if rel_path.startswith("Image"):
+    # 动态构建单板级别的相关附随路径
+    if len(parts) > 0 and parts[0] == "Image":
+        # 追加 TempInspResult 层
         temp_rel = rel_path.replace("Image", "TempInspResult", 1)
         if os.path.exists(os.path.join(src_base, temp_rel)):
             paths_to_sync.append(temp_rel)
             
-        timestamp_dir = os.path.basename(rel_path)
+        # 追加 ResultData 层
+        timestamp_dir = parts[-1]
         res_data_rel = os.path.join("ResultData", timestamp_dir)
         if os.path.exists(os.path.join(src_base, res_data_rel)):
             paths_to_sync.append(res_data_rel)
+            
+        # ⭐ 追加 FiduResult 层 (格式为：FiduResult/Group@Board@Board)
+        if len(parts) >= 3:
+            group_name = parts[1]
+            board_name = parts[2]
+            fidu_rel = os.path.join("FiduResult", f"{group_name}@{board_name}@{board_name}")
+            if os.path.exists(os.path.join(src_base, fidu_rel)) and fidu_rel not in paths_to_sync:
+                paths_to_sync.append(fidu_rel)
 
     for rel in paths_to_sync:
         src_path = os.path.join(src_base, rel)
         target_dir = os.path.join(dst_base, rel)
 
+        if not os.path.exists(src_path):
+            continue
+
+        # 仅当路径属于 Image 文件夹时才赋予物理删除权限
+        is_image_path = rel.startswith("Image")
+
         try:
             os.makedirs(os.path.dirname(target_dir), exist_ok=True)
 
-            if is_now_all_ok and rel.startswith("Image"):
+            # ======== 1. 同步 / 复制操作（写往维修站）========
+            if is_now_all_ok and is_image_path:
+                # 判为OK且是图片路径，只在维修站生成 OK xml，不全部复刻大量图片过去
                 os.makedirs(target_dir, exist_ok=True)
                 ok_xml_file_path = os.path.join(target_dir, "Total result OK.xml")
                 
@@ -469,19 +538,32 @@ def sync_and_move_board_packages(root_dir, src_base, dst_base, is_now_all_ok=Fal
                 with open(ok_xml_file_path, 'w', encoding='utf-8') as f:
                     f.write(content)
                 logging.info(f"AI 成功将当前单板包转为 OK 板格式写入维修站: {target_dir}")
-                continue
-            
-            if not is_now_all_ok:
+            else:
+                # 其他情况 (NG的Image, 或所有 TempInspResult/ResultData/FiduResult 等非Image路径) 均安全复制
                 if os.path.isdir(src_path):
                     shutil.copytree(src_path, target_dir, dirs_exist_ok=True)
                 else:
                     shutil.copy(src_path, target_dir)
-                logging.info(f"单板协同数据原样复制至维修站完成: {target_dir}")
-            else:
-                logging.info(f"进入全OK跳过数据原样复制分支，略过: {rel} 目录")
+                logging.info(f"协同数据复制同步至维修站: {target_dir}")
+
+            # ======== 2. 删除 / 清理操作（仅对源 Image 执行）========
+            if is_image_path:
+                if os.path.isdir(src_path):
+                    shutil.rmtree(src_path)
+                else:
+                    os.remove(src_path)
+                logging.info(f"已删除源判图触发数据: {src_path}")
+                
+                # 安全停止路径仅保留到 Image/HUAWEI 层
+                stop_path = src_base
+                rel_parts = Path(rel).parts
+                if len(rel_parts) >= 3:
+                    stop_path = os.path.join(src_base, rel_parts[0], rel_parts[1])
+                
+                remove_empty_dirs(src_path, stop_path)
 
         except Exception as e:
-            logging.error(f"协同包复制至维修站失败 {rel}: {e}")
+            logging.error(f"协同包转移至维修站或源文件清理过程中失败 {rel}: {e}")
 
 def process_all_files(check, directory, resPath):
     """监控引擎主控逻辑，深度扫描到最内层。"""
@@ -497,10 +579,15 @@ def process_all_files(check, directory, resPath):
     global disp
     disp = 1
     
-    # 跟踪已处理的路径，因为改用复制不删原文件，防止进入无限死循环
+    # 跟踪已处理的路径，以防意外
     processed_items = set()
 
     while check:
+        # ================== 核心修复 ==================
+        # 每次循环时，清洗掉硬盘上已经不存在的已处理记录。
+        # 这样如果你反复丢同一个名字的文件夹进去测试，就不会被拦截了。
+        processed_items = {p for p in processed_items if os.path.exists(p)}
+        
         okrange, collect, lag = read_threshold_from_config()
         
         if not os.path.exists(directory):
@@ -517,19 +604,19 @@ def process_all_files(check, directory, resPath):
                 if item == "NGBufferDataList.csv":
                     continue # NGBufferDataList.csv 最后处理
                 
-                # 处理根目录非核心文件夹 (改为复制)
+                # 处理根目录非核心文件夹 (保持原样，纯复制不删源)
                 if item not in ['Image', 'TempInspResult', 'ResultData', 'FiduResult'] and os.path.isdir(src_item):
                     if src_item not in processed_items:
                         dst_item = os.path.join(resPath, item)
                         try:
                             shutil.copytree(src_item, dst_item, dirs_exist_ok=True)
-                            logging.info(f"根目录非核心数据复制: {src_item} -> {dst_item}")
+                            logging.info(f"根目录非核心数据正常复制: {src_item} -> {dst_item}")
                             processed_any_file = True
                             processed_items.add(src_item)
                         except Exception as e:
                             logging.error(f"复制根目录条目失败 {src_item}: {e}")
 
-                # 处理核心文件夹内直接存在的游离文件
+                # 处理核心文件夹内直接存在的游离文件 (保持原样，纯复制不删源)
                 if item in ['TempInspResult', 'ResultData', 'Image', 'FiduResult'] and os.path.isdir(src_item):
                     for sub_item in os.listdir(src_item):
                         if sub_item == "NGBufferDataList.csv":
@@ -556,8 +643,12 @@ def process_all_files(check, directory, resPath):
                 dirs[:] = [] 
                 continue
 
-            if "Total result OK.xml" in files:
-                xml_path = os.path.join(root, "Total result OK.xml")
+            # 使用大小写不敏感匹配抓取文件名，防止漏判
+            lower_files = [f.lower() for f in files]
+
+            if "total result ok.xml" in lower_files:
+                exact_name = next(f for f in files if f.lower() == "total result ok.xml")
+                xml_path = os.path.join(root, exact_name)
                 if xml_path not in processed_items:
                     logging.info(f"扫描到原生 OK 板数据包，挂起 {lag} 秒等待文件完整写入...")
                     time.sleep(lag)
@@ -566,8 +657,9 @@ def process_all_files(check, directory, resPath):
                     processed_any_file = True
                 continue
 
-            if "Total result NG.xml" in files:
-                xml_path = os.path.join(root, "Total result NG.xml")
+            if "total result ng.xml" in lower_files:
+                exact_name = next(f for f in files if f.lower() == "total result ng.xml")
+                xml_path = os.path.join(root, exact_name)
                 if xml_path not in processed_items:
                     logging.info(f"扫描到复判缺陷数据包，挂起 {lag} 秒以防 IO 延迟...")
                     time.sleep(lag)
@@ -587,8 +679,10 @@ def process_all_files(check, directory, resPath):
                     os.makedirs(os.path.dirname(buffer_dst), exist_ok=True)
                     shutil.copy(buffer_src, buffer_dst)
                     logging.info(f"成功将 NGBufferDataList.csv 最终复制到: {buffer_dst}")
+                    os.remove(buffer_src)
                 except Exception as e:
                     logging.error(f"复制 NGBufferDataList.csv 失败: {e}")
+                    
 
         # ---------------- 步骤 4：动态休眠机制 ----------------
         if processed_any_file:
