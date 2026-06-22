@@ -296,7 +296,7 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                             best_idx = np.argmax(max_scores)
                             best_score = max_scores[best_idx]
 
-                            if best_score < okrange:
+                            if best_score < (okrange + 0.5):
                                 logging.info(f"  --> [Type3] 窗口:{win_id} 未检测到满足阈值的目标框，判定: NG")
                             else:
                                 best_pred = preds[best_idx]
@@ -344,7 +344,7 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                             
                             # 2. 转换为灰度图并增强对比度/亮度
                             gray_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
-                            enhanced_image = cv2.convertScaleAbs(gray_image, alpha=3, beta=0)
+                            enhanced_image = cv2.convertScaleAbs(gray_image, alpha=1.5, beta=0)
 
                             # 3. ONNX 图像预处理 (无需写入临时文件，缩放至 224x224, 转RGB, 归一化)
                             img_resized = cv2.resize(enhanced_image, (224, 224))
@@ -583,15 +583,14 @@ def process_all_files(check, directory, resPath):
     processed_items = set()
 
     while check:
-        # ================== 核心修复 ==================
-        # 每次循环时，清洗掉硬盘上已经不存在的已处理记录。
-        # 这样如果你反复丢同一个名字的文件夹进去测试，就不会被拦截了。
+
         processed_items = {p for p in processed_items if os.path.exists(p)}
         
         okrange, collect, lag = read_threshold_from_config()
         
         if not os.path.exists(directory):
             time.sleep(3)
+            logging.info(f"监控源为空: {directory}")
             continue
 
         processed_any_file = False
@@ -600,7 +599,6 @@ def process_all_files(check, directory, resPath):
         try:
             for item in os.listdir(directory):
                 src_item = os.path.join(directory, item)
-                
                 if item == "NGBufferDataList.csv":
                     continue # NGBufferDataList.csv 最后处理
                 
@@ -639,9 +637,10 @@ def process_all_files(check, directory, resPath):
 
         # ---------------- 步骤 2：深度遍历核心逻辑 ----------------
         for root, dirs, files in os.walk(directory):
-            if any(skip in root for skip in ['history', 'display', 'AI']):
-                dirs[:] = [] 
-                continue
+            
+            # 【核心修复】：直接在当前层级的 dirs 中移除不需要遍历的系统/结果文件夹。
+            # 这样就不会因为外层路径偶然包含 'AI' (如 D:/AI-test/) 而误杀整个目录树了。
+            dirs[:] = [d for d in dirs if d not in ['history', 'display', 'AI']]
 
             # 使用大小写不敏感匹配抓取文件名，防止漏判
             lower_files = [f.lower() for f in files]
