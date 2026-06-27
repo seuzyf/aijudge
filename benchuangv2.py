@@ -171,6 +171,7 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
             
         parent_id = get_text_ignore_case(part, ['ParentId', 'PARENTID', 'ParentID'])
         part_id = get_text_ignore_case(part, ['ID', 'Id', 'id'])
+        package_name = get_text_ignore_case(part, ['PackageName', 'PACKAGENAME', 'Packagename'])
         
         if parent_id == "Unknown" or part_id == "Unknown":
             continue
@@ -185,12 +186,7 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                     if sub_tag == 'a' and sub.text is not None:
                         try:
                             xml_angle = float(sub.text.strip())
-                            # 特殊角度转换对齐
-                            if xml_angle == 270.0:
-                                xml_angle = 90.0
-                            elif xml_angle == 90.0:
-                                xml_angle = 270.0
-                            logging.info(f"  --> [XML] 元件 {parent_id}@{part_id} 成功提取标准角度: {xml_angle}°")
+                            logging.info(f"  --> [XML] 元件 {parent_id}@{part_id} 成功提取原始角度: {xml_angle}°")
                         except ValueError:
                             pass
                 break
@@ -335,16 +331,28 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                     checkresult, res = "AING", "NG"
                     if ocr_session is not None:
                         try:
-                            # 1. 裁剪画面正中心的1/3区域
-                            new_w = w_img // 3
-                            new_h = h_img // 3
+                            # 判断封装类型以决定预处理参数
+                            logging.info(f"  --> [Type6] 当前元件封装类型: {package_name}")
+                            if 'RF' in package_name.upper():
+                                roi_ratio = 0.6
+                                alpha_val = 1.5
+                                beta_val = -50
+                            else:
+                                roi_ratio = 0.6
+                                alpha_val = 3.0
+                                beta_val = 10
+                            logging.info(f"  --> [Type6] 应用预处理参数 (ROI: {roi_ratio*100}%, Alpha: {alpha_val}, Beta: {beta_val})")
+
+                            # 1. 裁剪画面 ROI 区域
+                            new_w = int(w_img * roi_ratio)
+                            new_h = int(h_img * roi_ratio)
                             start_x = (w_img - new_w) // 2
                             start_y = (h_img - new_h) // 2
                             cropped_image = img_for_dim[start_y:start_y + new_h, start_x:start_x + new_w]
                             
                             # 2. 转换为灰度图并增强对比度/亮度
                             gray_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
-                            enhanced_image = cv2.convertScaleAbs(gray_image, alpha=1.5, beta=0)
+                            enhanced_image = cv2.convertScaleAbs(gray_image, alpha=alpha_val, beta=beta_val)
 
                             # 3. ONNX 图像预处理 (无需写入临时文件，缩放至 224x224, 转RGB, 归一化)
                             img_resized = cv2.resize(enhanced_image, (224, 224))
@@ -382,16 +390,24 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
 
                             if ocr_angle is not None:
                                 if xml_angle is not None:
-                                    valid_angles = [0.0, 90.0, 180.0, 270.0]
-                                    if ocr_angle in valid_angles and xml_angle in valid_angles:
-                                        if ocr_angle == xml_angle:
+                                    # 建立 CAD 角度到标准图片角度的映射表
+                                    cad_to_image_angle = {
+                                        0.0: 0.0, 45.0: 0.0, -315.0: 0.0, 60.0: 0.0, -300.0: 0.0, 300.0: 0.0, -60.0: 0.0,
+                                        90.0: 90.0, -270.0: 90.0, 135.0: 90.0, -225.0: 90.0, 150.0: 90.0, -210.0: 90.0, 30.0: 90.0, -150.0: 90.0,
+                                        180.0: 180.0, -180.0: 180.0, 225.0: 180.0, -135.0: 180.0, 240.0: 180.0, -120.0: 180.0, 120.0: 180.0, -240.0: 180.0,
+                                        270.0: 270.0, -90.0: 270.0, 315.0: 270.0, -45.0: 270.0, 330.0: 270.0, -30.0: 270.0, 210.0: 270.0, -330.0: 270.0
+                                    }
+                                    
+                                    if xml_angle in cad_to_image_angle:
+                                        expected_ocr_angle = cad_to_image_angle[xml_angle]
+                                        if ocr_angle == expected_ocr_angle:
                                             res = "OK"
                                             checkresult = "AIOK"
-                                            logging.info(f"  --> [Type6] OCR角度({ocr_angle}°) 与 XML标准角度({xml_angle}°) 一致。复判结果: OK")
+                                            logging.info(f"  --> [Type6] OCR角度({ocr_angle}°) 与 CAD等效角度({expected_ocr_angle}° <- {xml_angle}°) 一致。复判结果: OK")
                                         else:
-                                            logging.info(f"  --> [Type6] OCR角度({ocr_angle}°) 与 XML标准角度({xml_angle}°) 不一致。复判结果: NG")
+                                            logging.info(f"  --> [Type6] OCR角度({ocr_angle}°) 与 CAD等效角度({expected_ocr_angle}° <- {xml_angle}°) 不一致。复判结果: NG")
                                     else:
-                                        logging.info(f"  --> [Type6] 进入无效角度分支，标准或预测不在0/90/180/270中。复判结果: NG")
+                                        logging.info(f"  --> [Type6] CAD角度 {xml_angle}° 未在等效映射表中。复判结果: NG")
                                 else:
                                     logging.info(f"  --> [Type6] 当前元件在XML中无有效角度值，保持判NG")
                                     
@@ -586,6 +602,9 @@ def process_all_files(check, directory, resPath):
 
         processed_items = {p for p in processed_items if os.path.exists(p)}
         
+        # 记录本轮真实处理过的数据板时间戳(目录名通常即为时间戳)
+        processed_timestamps = set()
+        
         okrange, collect, lag = read_threshold_from_config()
         
         if not os.path.exists(directory):
@@ -638,11 +657,9 @@ def process_all_files(check, directory, resPath):
         # ---------------- 步骤 2：深度遍历核心逻辑 ----------------
         for root, dirs, files in os.walk(directory):
             
-            # 【核心修复】：直接在当前层级的 dirs 中移除不需要遍历的系统/结果文件夹。
-            # 这样就不会因为外层路径偶然包含 'AI' (如 D:/AI-test/) 而误杀整个目录树了。
-            dirs[:] = [d for d in dirs if d not in ['history', 'display', 'AI']]
+            # 直接在当前层级的 dirs 中移除不需要遍历的系统/结果文件夹。
+            dirs[:] = [d for d in dirs if d not in ['history', 'display', 'AI', 'InspectResult']]
 
-            # 使用大小写不敏感匹配抓取文件名，防止漏判
             lower_files = [f.lower() for f in files]
 
             if "total result ok.xml" in lower_files:
@@ -653,6 +670,10 @@ def process_all_files(check, directory, resPath):
                     time.sleep(lag)
                     sync_and_move_board_packages(root, directory, resPath, is_now_all_ok=False)
                     processed_items.add(xml_path)
+                    
+                    # 采集处理完毕的单板时间戳作为 CSV 清理的信标
+                    timestamp_dir = os.path.basename(root)
+                    processed_timestamps.add(timestamp_dir)
                     processed_any_file = True
                 continue
 
@@ -667,21 +688,90 @@ def process_all_files(check, directory, resPath):
                     
                     sync_and_move_board_packages(root, directory, resPath, is_now_all_ok=is_now_all_ok)
                     processed_items.add(xml_path)
+                    
+                    # 采集处理完毕的单板时间戳作为 CSV 清理的信标
+                    timestamp_dir = os.path.basename(root)
+                    processed_timestamps.add(timestamp_dir)
                     processed_any_file = True
 
-        # ---------------- 步骤 3：最后复制 NGBufferDataList.csv ----------------
-        if processed_any_file:
+        # ---------------- 步骤 3：NGBufferDataList.csv 精确流转与重排逻辑 ----------------
+        # 仅当此轮实际完成了板子复判（信标被点亮）时才介入修改 CSV
+        if processed_timestamps:
             buffer_src = os.path.join(directory, 'TempInspResult', 'NGBufferDataList.csv')
             buffer_dst = os.path.join(resPath, 'TempInspResult', 'NGBufferDataList.csv')
+            
             if os.path.exists(buffer_src):
                 try:
                     os.makedirs(os.path.dirname(buffer_dst), exist_ok=True)
-                    shutil.copy(buffer_src, buffer_dst)
-                    logging.info(f"成功将 NGBufferDataList.csv 最终复制到: {buffer_dst}")
-                    os.remove(buffer_src)
-                except Exception as e:
-                    logging.error(f"复制 NGBufferDataList.csv 失败: {e}")
                     
+                    src_keep_lines = []
+                    src_move_lines = []
+                    header = "Key, Board path"
+                    
+                    # 1. 拆包源 CSV：通过时间戳精确剥离被处理过的板子
+                    with open(buffer_src, 'r', encoding='utf-8-sig', errors='ignore') as f:
+                        lines = f.readlines()
+                        if lines:
+                            header = lines[0].strip()
+                            for line in lines[1:]:
+                                line = line.strip()
+                                if not line: continue
+                                
+                                # 解析逗号后的 Board path
+                                parts = line.split(',', 1)
+                                if len(parts) == 2:
+                                    bp = parts[1].strip()
+                                    # 提取 @ 符号前的时间戳进行匹配比对
+                                    timestamp = bp.split('@')[0] 
+                                    
+                                    if timestamp in processed_timestamps:
+                                        src_move_lines.append(bp)
+                                    else:
+                                        src_keep_lines.append(bp)
+                                else:
+                                    src_keep_lines.append(line)
+
+                    # 2. 如果成功提取到了本次流转的记录
+                    if src_move_lines:
+                        # 覆写源路径 CSV：抛弃已处理的，保留未处理的，从 0 重新编号
+                        with open(buffer_src, 'w', encoding='utf-8-sig') as f:
+                            f.write(header + "\n")
+                            for i, bp in enumerate(src_keep_lines):
+                                f.write(f"{i}, {bp}\n")
+                                
+                        # 解析维修站（目标）CSV，预备接收新数据
+                        dst_lines = []
+                        if os.path.exists(buffer_dst):
+                            with open(buffer_dst, 'r', encoding='utf-8-sig', errors='ignore') as f:
+                                dst_lines_raw = f.readlines()
+                                if len(dst_lines_raw) > 1:
+                                    for line in dst_lines_raw[1:]:
+                                        line = line.strip()
+                                        if not line: continue
+                                        parts = line.split(',', 1)
+                                        if len(parts) == 2:
+                                            dst_lines.append(parts[1].strip())
+                                        else:
+                                            dst_lines.append(line)
+                                            
+                        # 将被剥离的板子去重后挂载到维修站的末尾
+                        existing_bps = set(dst_lines)
+                        for bp in src_move_lines:
+                            if bp not in existing_bps:
+                                dst_lines.append(bp)
+                                
+                        # 覆写维修站 CSV：全部重新编号从 0 排列
+                        with open(buffer_dst, 'w', encoding='utf-8-sig') as f:
+                            f.write(header + "\n")
+                            for i, bp in enumerate(dst_lines):
+                                f.write(f"{i}, {bp}\n")
+                                
+                        logging.info(f"NGBufferDataList.csv 增量流转完毕: 从源移除 {len(src_move_lines)} 条单板数据, 保留 {len(src_keep_lines)} 条待处理, 并已安全同步至维修站。")
+                    else:
+                        logging.info("本次扫描处理未在 CSV 中检索到对应记录，略过更新。")
+                        
+                except Exception as e:
+                    logging.error(f"处理 NGBufferDataList.csv 增量同步时失败: {e}")
 
         # ---------------- 步骤 4：动态休眠机制 ----------------
         if processed_any_file:
