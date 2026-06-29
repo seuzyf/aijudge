@@ -176,7 +176,7 @@ class SettingsDialog(QDialog):
 
         # 行 4：设备类型
         self.device_combo = QComboBox()
-        self.device_combo.addItems(["神州", "神州SMT", "奔创", "奔创SMT", "Saki", "KY", "智能电动异物检测"])
+        self.device_combo.addItems(["神州", "神州SMT", "奔创", "奔创SMT", "奔创SMTv2","Saki", "KY", "智能电动异物检测"])
         device_item = QTableWidgetItem("设备类型")
         device_item.setFlags(device_item.flags() & ~Qt.ItemIsEditable)
         self.table.setItem(4, 0, device_item)
