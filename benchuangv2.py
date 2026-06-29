@@ -126,6 +126,56 @@ def write_to_history(task_order, program_name, board_code, image_name, ngtype, r
         writer = csv.writer(f)
         writer.writerow(new_row)
 
+def update_resultdata_xml(xml_path, ok_window_ids):
+    """
+    针对 ResultData.xml 的专用修复逻辑
+    将指定的窗口 <sWindId> 匹配，并将其 <m_bOk> 置为 1
+    :param ok_window_ids: 集合，包含需要置 OK 的窗口 ID (字符串形式的数字，如 {'1','3'})
+    """
+    if not os.path.exists(xml_path) or not ok_window_ids:
+        return False
+        
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        modified = False
+        
+        for insp_param in root.iter('InspParamTemp_Defect'):
+            # 优先用 sWindId 匹配
+            s_wind_id_node = insp_param.find('sWindId')
+            if s_wind_id_node is not None and s_wind_id_node.text:
+                wind_id = s_wind_id_node.text.strip()
+                if wind_id in ok_window_ids:
+                    m_bok_node = insp_param.find('m_bOk')
+                    if m_bok_node is not None and m_bok_node.text != '1':
+                        m_bok_node.text = '1'
+                        modified = True
+                        logging.info(f"  --> [ResultData同步] 窗口 sWindId={wind_id} 命中复判OK, <m_bOk> 已强制置为 1")
+            else:
+                # 如果没有 sWindId，回退尝试用 wndName 匹配（保持兼容）
+                wnd_name_node = insp_param.find('wndName')
+                if wnd_name_node is not None and wnd_name_node.text:
+                    name = wnd_name_node.text.strip()
+                    if name.startswith('window'):
+                        maybe_id = name[6:]  # 提取数字部分
+                        if maybe_id in ok_window_ids:
+                            m_bok_node = insp_param.find('m_bOk')
+                            if m_bok_node is not None and m_bok_node.text != '1':
+                                m_bok_node.text = '1'
+                                modified = True
+                                logging.info(f"  --> [ResultData同步] 窗口 wndName={name} 命中复判OK (回退匹配), <m_bOk> 已置为 1")
+                        
+        if modified:
+            tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+            logging.info(f"  --> [ResultData同步] 成功保存更新: {xml_path}")
+        else:
+            logging.warning(f"  --> [ResultData同步] 未在 {xml_path} 中找到匹配的窗口ID {ok_window_ids}，未做修改")
+        return True
+    except Exception as e:
+        logging.error(f"处理 ResultData.xml 时发生异常: {e}")
+        return False
+
+
 def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
     """核心：使用 ElementTree 结构化解析 Total result NG.xml。"""
     try:
@@ -161,6 +211,9 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
     modified = False
     total_win_checked = 0
     total_win_ok = 0
+    
+    # ======== 收集复判为 OK 的 Type6 窗口的数字 ID ========
+    type6_ok_window_ids = set()
 
     for idx, node in enumerate(loop_nodes, 1):
         if is_container_mode:
@@ -213,7 +266,6 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
         
         # ================== 核心修复：绕过 OpenCV 的中文路径读取 Bug ==================
         try:
-            # 使用 numpy 以二进制流读入内存，再通过 imdecode 解码
             img_for_dim = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
         except Exception as e:
             img_for_dim = None
@@ -229,8 +281,15 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
         window_nodes = node.findall('.//WindowData') or node.findall('.//WINDOWDATA') or node.findall('.//windowdata')
         
         for window in window_nodes:
-            win_id = get_text_ignore_case(window, ['ID', 'Id', 'id'])
-            
+            # ---------- 提取窗口ID并处理成纯数字 ----------
+            raw_win_id = get_text_ignore_case(window, ['ID', 'Id', 'id'])
+            # 如果ID形如 "window1"，提取数字部分；否则直接使用
+            if raw_win_id.lower().startswith('window'):
+                win_id = raw_win_id[6:]  # 去掉 "window" 前缀，例如 "1"
+            else:
+                win_id = raw_win_id
+            # ------------------------------------------------
+
             enable_node = None
             for e_tag in ['ENABLE', 'Enable', 'enable', 'IsEnable']:
                 enable_node = window.find(e_tag)
@@ -263,12 +322,12 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                 if algo_type == '3':
                     if yolo_session is not None:
                         try:
-                            # 1. 动态读取模型输入尺寸 (OBB 通常为 1024x1024)
+                            # 动态读取模型输入尺寸 (OBB 通常为 1024x1024)
                             yolo_input_shape = yolo_session.get_inputs()[0].shape
                             model_h = yolo_input_shape[2] if isinstance(yolo_input_shape[2], int) else 1024
                             model_w = yolo_input_shape[3] if isinstance(yolo_input_shape[3], int) else 1024
                             
-                            # 2. Letterbox 尺寸缩放，保证目标不形变
+                            # Letterbox 尺寸缩放
                             scale = min(model_w / w_img, model_h / h_img)
                             new_unpad_w, new_unpad_h = int(round(w_img * scale)), int(round(h_img * scale))
                             dw, dh = (model_w - new_unpad_w) / 2, (model_h - new_unpad_h) / 2
@@ -278,15 +337,12 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                             left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
                             padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
                             
-                            # 3. HWC to CHW 及归一化
                             blob = padded[..., ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
                             blob = np.expand_dims(blob, axis=0)
                             
-                            # 4. 执行推理
                             yolo_out = yolo_session.run(None, {yolo_session.get_inputs()[0].name: blob})[0]
-                            preds = yolo_out[0].T # 转置为 [N, 4 + num_classes + 1]
+                            preds = yolo_out[0].T
 
-                            # 5. 直接提取最高置信度的目标
                             class_scores = preds[:, 4:-1]
                             max_scores = np.max(class_scores, axis=1)
                             best_idx = np.argmax(max_scores)
@@ -298,9 +354,8 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                                 best_pred = preds[best_idx]
                                 cls_id = int(np.argmax(best_pred[4:-1]))
                                 pred_x, pred_y = best_pred[0], best_pred[1]
-                                pred_r = best_pred[-1] # ONNX导出的 YOLOv8-OBB 角度直接为弧度
+                                pred_r = best_pred[-1]
                                 
-                                # 坐标映射回原图
                                 orig_x = (pred_x - left) / scale
                                 orig_y = (pred_y - top) / scale
                                 
@@ -331,7 +386,6 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                     checkresult, res = "AING", "NG"
                     if ocr_session is not None:
                         try:
-                            # 判断封装类型以决定预处理参数
                             logging.info(f"  --> [Type6] 当前元件封装类型: {package_name}")
                             if 'RF' in package_name.upper():
                                 roi_ratio = 0.6
@@ -343,18 +397,15 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                                 beta_val = 10
                             logging.info(f"  --> [Type6] 应用预处理参数 (ROI: {roi_ratio*100}%, Alpha: {alpha_val}, Beta: {beta_val})")
 
-                            # 1. 裁剪画面 ROI 区域
                             new_w = int(w_img * roi_ratio)
                             new_h = int(h_img * roi_ratio)
                             start_x = (w_img - new_w) // 2
                             start_y = (h_img - new_h) // 2
                             cropped_image = img_for_dim[start_y:start_y + new_h, start_x:start_x + new_w]
                             
-                            # 2. 转换为灰度图并增强对比度/亮度
                             gray_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
                             enhanced_image = cv2.convertScaleAbs(gray_image, alpha=alpha_val, beta=beta_val)
 
-                            # 3. ONNX 图像预处理 (无需写入临时文件，缩放至 224x224, 转RGB, 归一化)
                             img_resized = cv2.resize(enhanced_image, (224, 224))
                             if len(img_resized.shape) == 2:
                                 img_resized = cv2.cvtColor(img_resized, cv2.COLOR_GRAY2RGB)
@@ -367,10 +418,8 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                             
                             input_tensor = np.expand_dims(np.transpose(img_normalized, (2, 0, 1)), axis=0)
 
-                            # 4. 执行推理
                             ocr_out = ocr_session.run(None, {ocr_session.get_inputs()[0].name: input_tensor})[0]
                             
-                            # 5. Softmax 解析结果
                             probs = np.exp(ocr_out[0]) / np.sum(np.exp(ocr_out[0]))
                             class_id = int(np.argmax(probs))
                             ocr_score = float(probs[class_id])
@@ -390,12 +439,11 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
 
                             if ocr_angle is not None:
                                 if xml_angle is not None:
-                                    # 建立 CAD 角度到标准图片角度的映射表
                                     cad_to_image_angle = {
                                         0.0: 0.0, 45.0: 0.0, -315.0: 0.0, 60.0: 0.0, -300.0: 0.0, 300.0: 0.0, -60.0: 0.0,
-                                        90.0: 90.0, -270.0: 90.0, 135.0: 90.0, -225.0: 90.0, 150.0: 90.0, -210.0: 90.0, 30.0: 90.0, -150.0: 90.0,
+                                        90.0: 270.0, -270.0: 270.0, 135.0: 270.0, -225.0: 270.0, 150.0: 270.0, -210.0: 270.0, 30.0: 270.0, -150.0: 270.0,
                                         180.0: 180.0, -180.0: 180.0, 225.0: 180.0, -135.0: 180.0, 240.0: 180.0, -120.0: 180.0, 120.0: 180.0, -240.0: 180.0,
-                                        270.0: 270.0, -90.0: 270.0, 315.0: 270.0, -45.0: 270.0, 330.0: 270.0, -30.0: 270.0, 210.0: 270.0, -330.0: 270.0
+                                        270.0: 90.0, -90.0: 90.0, 315.0: 90.0, -45.0: 90.0, 330.0: 90.0, -30.0: 90.0, 210.0: 90.0, -330.0: 90.0
                                     }
                                     
                                     if xml_angle in cad_to_image_angle:
@@ -404,6 +452,9 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                                             res = "OK"
                                             checkresult = "AIOK"
                                             logging.info(f"  --> [Type6] OCR角度({ocr_angle}°) 与 CAD等效角度({expected_ocr_angle}° <- {xml_angle}°) 一致。复判结果: OK")
+                                            # ========= 核心联动：记录 Type6 成功的窗口数字 ID =========
+                                            type6_ok_window_ids.add(win_id)
+                                            # ========================================================
                                         else:
                                             logging.info(f"  --> [Type6] OCR角度({ocr_angle}°) 与 CAD等效角度({expected_ocr_angle}° <- {xml_angle}°) 不一致。复判结果: NG")
                                     else:
@@ -444,6 +495,25 @@ def process_single_xml(xml_path, folder_path, okrange, collect, okPath, ngPath):
                 logging.info(f" -> 成功修正: 整个窗口 ID {win_id} 已安全关闭")
 
     logging.info(f"单板 {board_code} 复判完成：共检查支持的NG窗口 {total_win_checked} 个，修正为 OK 的窗口 {total_win_ok} 个")
+
+    # ================= 联动执行 ResultData.xml 的修复动作 =================
+    if type6_ok_window_ids:
+        try:
+            parts = Path(folder_path).parts
+            if 'Image' in parts:
+                idx = parts.index('Image')
+                new_parts = list(parts)
+                new_parts[idx] = 'TempInspResult'
+                resultdata_dir = Path(*new_parts)
+                resultdata_xml_path = resultdata_dir / "ResultData.xml"
+                
+                if resultdata_xml_path.exists():
+                    update_resultdata_xml(str(resultdata_xml_path), type6_ok_window_ids)
+                else:
+                    logging.warning(f"  --> [ResultData同步] 未找到对应的关联文件: {resultdata_xml_path}")
+        except Exception as e:
+            logging.error(f"  --> [ResultData同步] 自动寻址与修改发生异常: {e}")
+    # ====================================================================
 
     any_ng_remaining = False
     all_windows = root.findall('.//WindowData') or root.findall('.//WINDOWDATA') or root.findall('.//windowdata')
@@ -777,4 +847,4 @@ def process_all_files(check, directory, resPath):
         if processed_any_file:
             time.sleep(0.5)
         else:
-            time.sleep(3)
+            time.sleep(3) 
